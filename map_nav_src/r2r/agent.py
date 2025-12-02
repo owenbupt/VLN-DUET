@@ -415,14 +415,18 @@ class GMapNavAgent(Seq2SeqAgent):
                     )
                 elif self.args.dataset == 'r4r':
                     nav_targets = self._teacher_action_r4r(
-                        obs, nav_vpids, ended, 
+                        obs, nav_vpids, ended,
                         visited_masks=nav_inputs['gmap_visited_masks'] if self.args.fusion != 'local' else None,
                         imitation_learning=(self.feedback=='teacher'), t=t, traj=traj
                     )
                 # print(t, nav_logits, nav_targets)
                 ml_loss += self.criterion(nav_logits, nav_targets)
                 # print(t, 'ml_loss', ml_loss.item(), self.criterion(nav_logits, nav_targets).item())
-                                                 
+
+                causal_loss = self._compute_causal_consistency(nav_outs, nav_logits, nav_inputs)
+                if isinstance(causal_loss, torch.Tensor) or causal_loss != 0:
+                    self.loss += causal_loss
+
             # Determinate the next navigation viewpoint
             if self.feedback == 'teacher':
                 a_t = nav_targets                 # teacher forcing

@@ -15,6 +15,7 @@ from torch import Tensor, device, dtype
 
 from transformers import BertPreTrainedModel
 
+from .counterfactual import LatentCounterfactualGenerator
 from .ops import create_transformer_encoder
 from .ops import extend_neg_masks, gen_seq_masks, pad_tensors_wgrad
 
@@ -676,7 +677,17 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.sap_fuse_linear = None
         if self.config.obj_feat_size > 0:
             self.og_head = ClsPrediction(self.config.hidden_size)
-        
+
+        if getattr(config, "counterfactual_top_ratio", 0) > 0:
+            self.counterfactual = LatentCounterfactualGenerator(
+                hidden_size=self.config.hidden_size,
+                top_ratio=config.counterfactual_top_ratio,
+                noise_scale=getattr(config, "counterfactual_noise_scale", 0.1),
+                dropout=getattr(config, "counterfactual_dropout", config.hidden_dropout_prob),
+            )
+        else:
+            self.counterfactual = None
+
         self.init_weights()
         
         if config.fix_lang_embedding or config.fix_local_branch:
@@ -747,6 +758,61 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         return pano_embeds, pano_masks
 
+    def _compute_navigation_logits(
+        self, gmap_embeds, gmap_masks, gmap_visited_masks, gmap_vpids,
+        vp_embeds, vp_masks, vp_nav_masks, vp_obj_masks, vp_cand_vpids,
+    ):
+        batch_size = gmap_embeds.size(0)
+
+        if self.sap_fuse_linear is None:
+            fuse_weights = 0.5
+        else:
+            fuse_weights = torch.sigmoid(self.sap_fuse_linear(
+                torch.cat([gmap_embeds[:, 0], vp_embeds[:, 0]], 1)
+            ))
+
+        global_logits = self.global_sap_head(gmap_embeds).squeeze(2) * fuse_weights
+        global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
+        global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
+
+        local_logits = self.local_sap_head(vp_embeds).squeeze(2) * (1 - fuse_weights)
+        local_logits.masked_fill_(vp_nav_masks.logical_not(), -float('inf'))
+
+        fused_logits = torch.clone(global_logits)
+        fused_logits[:, 0] += local_logits[:, 0]   # stop
+        for i in range(batch_size):
+            visited_nodes = set([vp for vp, mask in zip(gmap_vpids[i], gmap_visited_masks[i]) if mask])
+            tmp = {}
+            bw_logits = 0
+            for j, cand_vpid in enumerate(vp_cand_vpids[i]):
+                if j > 0:
+                    if cand_vpid in visited_nodes:
+                        bw_logits += local_logits[i, j]
+                    else:
+                        tmp[cand_vpid] = local_logits[i, j]
+            for j, vp in enumerate(gmap_vpids[i]):
+                if j > 0 and vp not in visited_nodes:
+                    if vp in tmp:
+                        fused_logits[i, j] += tmp[vp]
+                    else:
+                        fused_logits[i, j] += bw_logits
+
+        if vp_obj_masks is not None:
+            obj_logits = self.og_head(vp_embeds).squeeze(2)
+            obj_logits.masked_fill_(vp_obj_masks.logical_not(), -float('inf'))
+        else:
+            obj_logits = None
+
+        outs = {
+            'gmap_embeds': gmap_embeds,
+            'vp_embeds': vp_embeds,
+            'global_logits': global_logits,
+            'local_logits': local_logits,
+            'fused_logits': fused_logits,
+            'obj_logits': obj_logits,
+        }
+        return outs
+
     def forward_navigation_per_step(
         self, txt_embeds, txt_masks, gmap_img_embeds, gmap_step_ids, gmap_pos_fts, 
         gmap_masks, gmap_pair_dists, gmap_visited_masks, gmap_vpids,
@@ -774,60 +840,28 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         vp_embeds = vp_img_embeds + self.local_encoder.vp_pos_embeddings(vp_pos_fts)
         vp_embeds = self.local_encoder.encoder(txt_embeds, txt_masks, vp_embeds, vp_masks)
             
-        # navigation logits
-        if self.sap_fuse_linear is None:
-            fuse_weights = 0.5
-        else:
-            fuse_weights = torch.sigmoid(self.sap_fuse_linear(
-                torch.cat([gmap_embeds[:, 0], vp_embeds[:, 0]], 1)
-            ))
-        # print(fuse_weights)
+        outs = self._compute_navigation_logits(
+            gmap_embeds, gmap_masks, gmap_visited_masks, gmap_vpids,
+            vp_embeds, vp_masks, vp_nav_masks, vp_obj_masks, vp_cand_vpids,
+        )
 
-        global_logits = self.global_sap_head(gmap_embeds).squeeze(2) * fuse_weights
-        global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
-        global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
-        # print('global', torch.softmax(global_logits, 1)[0], global_logits[0])
-
-        local_logits = self.local_sap_head(vp_embeds).squeeze(2) * (1 - fuse_weights)
-        local_logits.masked_fill_(vp_nav_masks.logical_not(), -float('inf'))
-        # print('local', torch.softmax(local_logits, 1)[0], local_logits[0])
-
-        # fusion
-        fused_logits = torch.clone(global_logits)
-        fused_logits[:, 0] += local_logits[:, 0]   # stop
-        for i in range(batch_size):
-            visited_nodes = set([vp for vp, mask in zip(gmap_vpids[i], gmap_visited_masks[i]) if mask])
-            tmp = {}
-            bw_logits = 0
-            for j, cand_vpid in enumerate(vp_cand_vpids[i]):
-                if j > 0:
-                    if cand_vpid in visited_nodes:
-                        bw_logits += local_logits[i, j]
-                    else:
-                        tmp[cand_vpid] = local_logits[i, j]
-            for j, vp in enumerate(gmap_vpids[i]):
-                if j > 0 and vp not in visited_nodes:
-                    if vp in tmp:
-                        fused_logits[i, j] += tmp[vp]
-                    else:
-                        fused_logits[i, j] += bw_logits
-        # print('fused', torch.softmax(fused_logits, 1)[0], fused_logits[0])
-
-        # object grounding logits
-        if vp_obj_masks is not None:
-            obj_logits = self.og_head(vp_embeds).squeeze(2)
-            obj_logits.masked_fill_(vp_obj_masks.logical_not(), -float('inf'))
-        else:
-            obj_logits = None
-
-        outs = {
-            'gmap_embeds': gmap_embeds,
-            'vp_embeds': vp_embeds,
-            'global_logits': global_logits,
-            'local_logits': local_logits,
-            'fused_logits': fused_logits,
-            'obj_logits': obj_logits,
-        }
+        if self.counterfactual is not None and self.training:
+            cf_gmap_embeds, cf_gmap_meta = self.counterfactual(
+                gmap_embeds, gmap_masks, txt_embeds, txt_masks
+            )
+            cf_vp_embeds, cf_vp_meta = self.counterfactual(
+                vp_embeds, vp_masks, txt_embeds, txt_masks
+            )
+            cf_outs = self._compute_navigation_logits(
+                cf_gmap_embeds, gmap_masks, gmap_visited_masks, gmap_vpids,
+                cf_vp_embeds, vp_masks, vp_nav_masks, vp_obj_masks, vp_cand_vpids,
+            )
+            cf_outs['counterfactual_masks'] = {'gmap': cf_gmap_meta['perturb_mask'], 'vp': cf_vp_meta['perturb_mask']}
+            cf_outs['counterfactual_weights'] = {'gmap': cf_gmap_meta['weights'], 'vp': cf_vp_meta['weights']}
+            cf_outs['factual_embeds'] = {'gmap': cf_gmap_meta['factual'], 'vp': cf_vp_meta['factual']}
+            cf_outs['counterfactual_embeds'] = {'gmap': cf_gmap_embeds, 'vp': cf_vp_embeds}
+            cf_outs['masks'] = {'gmap': gmap_masks, 'vp': vp_masks}
+            outs['counterfactual'] = cf_outs
         return outs
 
     def forward(self, mode, batch, **kwargs):

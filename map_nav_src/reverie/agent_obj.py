@@ -408,7 +408,11 @@ class GMapObjectNavAgent(Seq2SeqAgent):
                 og_loss += self.criterion(obj_logits, obj_targets)
                 # print(F.cross_entropy(obj_logits, obj_targets, reduction='none'))
                 # print(t, 'og_loss', og_loss.item(), self.criterion(obj_logits, obj_targets).item())
-                                                   
+
+                causal_loss = self._compute_causal_consistency(nav_outs, nav_logits, nav_inputs)
+                if isinstance(causal_loss, torch.Tensor) or causal_loss != 0:
+                    self.loss += causal_loss
+
             # Determinate the next navigation viewpoint
             if self.feedback == 'teacher':
                 a_t = nav_targets                 # teacher forcing

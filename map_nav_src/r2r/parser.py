@@ -62,6 +62,12 @@ def parse_args():
     # Dropout Param
     parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--feat_dropout', type=float, default=0.3)
+    parser.add_argument('--counterfactual_top_ratio', type=float, default=0.3)
+    parser.add_argument('--counterfactual_noise_scale', type=float, default=0.1)
+    parser.add_argument('--counterfactual_dropout', type=float, default=0.1)
+    parser.add_argument('--counterfactual_lambda', type=float, default=0.1)
+    parser.add_argument('--counterfactual_divergence', type=float, default=1.0)
+    parser.add_argument('--counterfactual_consistency', type=float, default=0.5)
 
     # Submision configuration
     parser.add_argument('--test', action='store_true', default=False)

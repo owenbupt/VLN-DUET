@@ -51,6 +51,10 @@ def get_vlnbert_models(args, config=None):
     vis_config.fix_pano_embedding = args.fix_pano_embedding
     vis_config.fix_local_branch = args.fix_local_branch
 
+    vis_config.counterfactual_top_ratio = getattr(args, 'counterfactual_top_ratio', 0.0)
+    vis_config.counterfactual_noise_scale = getattr(args, 'counterfactual_noise_scale', 0.1)
+    vis_config.counterfactual_dropout = getattr(args, 'counterfactual_dropout', vis_config.hidden_dropout_prob)
+
     vis_config.update_lang_bert = not args.fix_lang_embedding
     vis_config.output_attentions = True
     vis_config.pred_head_dropout_prob = 0.1

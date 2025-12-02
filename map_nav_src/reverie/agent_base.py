@@ -147,6 +147,40 @@ class Seq2SeqAgent(BaseAgent):
     def _build_model(self):
         raise NotImplementedError('child class should implement _build_model: self.vln_bert & self.critic')
 
+    def _compute_causal_consistency(self, nav_outs, nav_logits, nav_inputs):
+        if getattr(self.args, 'counterfactual_lambda', 0) <= 0:
+            return 0.0
+        cf_outs = nav_outs.get('counterfactual') if isinstance(nav_outs, dict) else None
+        if cf_outs is None:
+            return 0.0
+
+        factual_probs = torch.softmax(nav_logits.detach(), dim=1)
+        cf_probs = torch.softmax(cf_outs['fused_logits'], dim=1)
+        divergence = F.kl_div(torch.log(cf_probs + 1e-8), factual_probs, reduction='batchmean') + \
+                     F.kl_div(torch.log(factual_probs + 1e-8), cf_probs, reduction='batchmean')
+
+        consistency = torch.zeros(1, device=nav_logits.device)
+        for branch, mask in cf_outs['counterfactual_masks'].items():
+            base = cf_outs['factual_embeds'][branch]
+            cf_embed = cf_outs['counterfactual_embeds'][branch]
+            if branch == 'gmap':
+                valid_mask = nav_inputs['gmap_masks'] & (~mask)
+            else:
+                valid_mask = nav_inputs['vp_masks'] & (~mask)
+            if valid_mask.any():
+                diff = (cf_embed - base).pow(2) * valid_mask.unsqueeze(-1)
+                consistency = consistency + diff.sum() / torch.clamp(valid_mask.sum(), min=1)
+
+        causal_loss = self.args.counterfactual_lambda * (
+            self.args.counterfactual_consistency * consistency -
+            self.args.counterfactual_divergence * divergence
+        )
+
+        self.logs['CAUSAL_div'].append(divergence.item())
+        self.logs['CAUSAL_cons'].append(consistency.item())
+        self.logs['CAUSAL_loss'].append(causal_loss.item())
+        return causal_loss
+
     def test(self, use_dropout=False, feedback='argmax', allow_cheat=False, iters=None, viz=False):
         ''' Evaluate once on each instruction in the current environment '''
         self.feedback = feedback
